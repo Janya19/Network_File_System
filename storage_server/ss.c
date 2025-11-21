@@ -14,12 +14,14 @@
 #include <errno.h>
 #include <dirent.h>   // For directory operations
 #include <arpa/inet.h> // For inet_pton    
+#include "config.h"  // Add at top
+char g_nm_ip[INET_ADDRSTRLEN] = "127.0.0.1";
 
 FILE* g_log_fp = NULL;
 pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 char g_ss_root_path[64];
 
-#define NM_IP "127.0.0.1" // IP for the Name Server (NM)
+// #define NM_IP "127.0.0.1" // IP for the Name Server (NM)
 
 // --- Global Lock Manager ---
 typedef struct {
@@ -203,6 +205,8 @@ void log_event(const char* message) {
 }
 
 // Connects to NM, sends one message, and disconnects.
+// Replace the entire send_async_update_to_nm function with this:
+
 void send_async_update_to_nm(char* message) {
     int temp_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (temp_sock < 0) {
@@ -211,20 +215,20 @@ void send_async_update_to_nm(char* message) {
     }
 
     struct sockaddr_in nm_addr;
-    struct hostent *nm_server = gethostbyname(NM_IP);
-    if (nm_server == NULL) {
-        fprintf(stderr, "ERROR, no such host as %s\n", NM_IP);
+    memset(&nm_addr, 0, sizeof(nm_addr));
+    nm_addr.sin_family = AF_INET;
+    nm_addr.sin_port = htons(NM_LISTEN_PORT);
+    
+    // Use the global variable we saved in main
+    if (inet_pton(AF_INET, g_nm_ip, &nm_addr.sin_addr) <= 0) {
+        fprintf(stderr, "[SS] ERROR: Invalid NM IP in async update: %s\n", g_nm_ip);
         close(temp_sock);
         return;
     }
 
-    memset(&nm_addr, 0, sizeof(nm_addr));
-    nm_addr.sin_family = AF_INET;
-    nm_addr.sin_port = htons(NM_LISTEN_PORT);
-    memcpy(&nm_addr.sin_addr.s_addr, nm_server->h_addr_list[0], nm_server->h_length);
-
     if (connect(temp_sock, (struct sockaddr *) &nm_addr, sizeof(nm_addr)) < 0) {
-        perror("send_async: connect");
+        // Only print error if it's NOT a "Connection refused" (NM might be down)
+        // perror("send_async: connect"); 
         close(temp_sock);
         return;
     }
@@ -1012,17 +1016,18 @@ void *handle_client_request(void *arg) {
             char word_buffer[256];
             // Read one WORD at a time (fscanf handles whitespace)
             while (fscanf(fp, "%255s", word_buffer) == 1) {
-                // Send the word
-                if (send(client_fd, word_buffer, strlen(word_buffer), 0) == -1) {
-                    break; // Client disconnected
+                // Send the word with MSG_NOSIGNAL to prevent crash on pipe error
+                if (send(client_fd, word_buffer, strlen(word_buffer), MSG_NOSIGNAL) == -1) {
+                    printf("[SS-Client] Stream interrupted (Client disconnected).\n");
+                    break; 
                 }
                 // Send a space after the word
-                if (send(client_fd, " ", 1, 0) == -1) {
-                    break; // Client disconnected
+                if (send(client_fd, " ", 1, MSG_NOSIGNAL) == -1) {
+                    break; 
                 }
                 
                 // The 0.1 second delay
-                usleep(STREAM_DELAY_US); // From protocol.h
+                usleep(STREAM_DELAY_US); 
             }
             fclose(fp);
             printf("[SS-Client] Stream complete for: %s\n", filename);
@@ -1376,14 +1381,17 @@ int main(int argc, char* argv[]) {
     }
     log_event("--- Storage Server Started ---");
     
-    // We need the user to tell us what port to listen on
-    // e.g., ./bin/storage_server 9002
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <client-facing-port>\n", argv[0]);
+    // UPDATED ARGUMENT PARSING FOR MULTI-MACHINE SUPPORT
+    if (argc < 4) {
+        fprintf(stderr, "Usage: %s <client-facing-port> <nm-ip> <my-ip>\n", argv[0]);
+        fprintf(stderr, "Example: ./bin/storage_server 9002 192.168.1.10 192.168.1.20\n");
         exit(1);
     }
-    int client_port_for_ss = atoi(argv[1]);
 
+    int client_port_for_ss = atoi(argv[1]);
+    char* nm_ip_arg = argv[2];    // IP of the Name Server
+    char* my_ip_arg = argv[3];    // IP of THIS Storage Server (accessible by others)
+    strcpy(g_nm_ip, nm_ip_arg); // Save NM IP for later use 
     snprintf(g_ss_root_path, sizeof(g_ss_root_path), "ss_data/%d", client_port_for_ss);
 
     // 2. Create parent directory "ss_data"
@@ -1402,10 +1410,9 @@ int main(int argc, char* argv[]) {
     printf("[SS] Storage root path set to: %s\n", g_ss_root_path);
     
     // --- CLIENT PART: Connect to Name Server ---
-    printf("SS starting... connecting to Name Server...\n");
+    printf("SS starting... connecting to Name Server at %s...\n", nm_ip_arg);
     
     struct sockaddr_in nm_addr;
-    struct hostent *nm_server;
 
     g_nm_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (g_nm_fd < 0) {
@@ -1413,16 +1420,15 @@ int main(int argc, char* argv[]) {
         exit(1);
     }
 
-    nm_server = gethostbyname("localhost");
-    if (nm_server == NULL) {
-        fprintf(stderr, "ERROR, no such host as localhost\n");
-        exit(1);
-    }
-
     memset(&nm_addr, 0, sizeof(nm_addr));
     nm_addr.sin_family = AF_INET;
-    nm_addr.sin_port = htons(NM_LISTEN_PORT); // From protocol.h
-    memcpy(&nm_addr.sin_addr.s_addr, nm_server->h_addr_list[0], nm_server->h_length);
+    nm_addr.sin_port = htons(NM_LISTEN_PORT);
+    
+    // USE THE COMMAND LINE ARGUMENT FOR NM IP
+    if (inet_pton(AF_INET, nm_ip_arg, &nm_addr.sin_addr) <= 0) {
+        fprintf(stderr, "Invalid Name Server IP address: %s\n", nm_ip_arg);
+        exit(1);
+    }
 
     if (connect(g_nm_fd, (struct sockaddr *) &nm_addr, sizeof(nm_addr)) < 0) {
         perror("SS connect() to NM failed");
@@ -1435,11 +1441,9 @@ int main(int argc, char* argv[]) {
     char reg_buffer[MAX_MSG_LEN];
     memset(reg_buffer, 0, MAX_MSG_LEN);
     
-    // S_INIT <ip> <nm_port> <client_port>
-    // We'll hardcode "127.0.0.1" for the IP
-    // We can send 0 for nm_port, our NM doesn't use it
-    sprintf(reg_buffer, "%s %s %d %d\n", S_INIT, "127.0.0.1", 0, client_port_for_ss);
-    
+    // USE THE COMMAND LINE ARGUMENT FOR OWN IP
+    // S_INIT <my_ip> <nm_port> <client_port>
+    sprintf(reg_buffer, "%s %s %d %d\n", S_INIT, my_ip_arg, 0, client_port_for_ss);
     printf("Sending registration: %s", reg_buffer);
     write(g_nm_fd, reg_buffer, strlen(reg_buffer));
     

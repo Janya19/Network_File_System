@@ -1,6 +1,8 @@
 #include "protocol.h"
 //our file which tells this code of our own defined stuff for the network protocol (shared constants, command strings, and response codes)
 
+#include "config.h" 
+
 #include <stdio.h>
 //for printf and perror
 
@@ -54,18 +56,6 @@ typedef struct {
     char username[MAX_USERNAME_LEN];
     char permission; // Will hold 'R' or 'W'
 } AclEntry;
-
-typedef struct{
-    int conn_fd; //persistent file descriptor to this storage server
-    char ip[INET_ADDRSTRLEN]; //client facing ip
-    int client_port; //client facing ip
-    //maybe more will be added later
-}StorageServer;
-
-# define MAX_SS 10 // WHAT IS MAX NO OF STORAGE SERVERS WE ARE ALLOWING, CAN BE CHANGED LATER
-StorageServer g_ss_list[MAX_SS]; 
-int g_ss_count=0;
-pthread_mutex_t ss_list_mutex=PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct{
     int conn_fd;
@@ -230,7 +220,7 @@ void* async_write_thread(void* arg);
 int select_replica_ss(int exclude_ss_index);
 void enqueue_async_write(const char* filename, const char* operation, int target_ss);
 void handle_ss_failure(int failed_ss_index);
-void handle_ss_recovery(int recovered_ss_index);
+void* handle_ss_recovery(void* arg);
 
 
 
@@ -630,12 +620,12 @@ void do_exec(int client_fd, char* username, char* filename) {
     int ss_index = file->ss_index;
     pthread_mutex_unlock(&file_map_mutex);
 
-    // 7. Get SS Info
-    pthread_mutex_lock(&ss_list_mutex);
+// 4. Get SS client-facing IP/port
+    pthread_mutex_lock(&ss_list_mutex_ext);       
     char ss_ip[INET_ADDRSTRLEN];
-    int ss_port = g_ss_list[ss_index].client_port;
-    strcpy(ss_ip, g_ss_list[ss_index].ip);
-    pthread_mutex_unlock(&ss_list_mutex);
+    int ss_port = g_ss_list_ext[ss_index].client_port;
+    strcpy(ss_ip, g_ss_list_ext[ss_index].ip);        
+    pthread_mutex_unlock(&ss_list_mutex_ext);      
 
     // 8. NM connects TO SS
     int ss_sock = connect_to_server(ss_ip, ss_port);
@@ -732,67 +722,83 @@ void do_create(int client_fd, char* username, char* filename) {
         return;
     }
     
-    // 2. Check if any SS is available
-    if (g_ss_count == 0) {
+    // 2. Select an ONLINE Primary SS
+    pthread_mutex_lock(&ss_list_mutex_ext);
+    
+    if (g_ss_count_ext == 0) {
+        pthread_mutex_unlock(&ss_list_mutex_ext);
         snprintf(resp_buf, MAX_MSG_LEN, "%s\n", RESP_SS_DOWN);
         send(client_fd, resp_buf, strlen(resp_buf), 0);
         pthread_mutex_unlock(&file_map_mutex);
         return;
     }
     
-    // 3. Select primary SS
-    ss_index = g_file_count % g_ss_count;
+    // Start searching from a round-robin index
+    int start_idx = g_file_count % g_ss_count_ext;
+    int attempts = 0;
     
-    pthread_mutex_lock(&ss_list_mutex_ext);
-    ss_fd = g_ss_list_ext[ss_index].conn_fd;
-    // **DON'T UNLOCK YET - Keep it locked during send AND read**
+    // Loop to find the first ONLINE server
+    while (attempts < g_ss_count_ext) {
+        int curr_idx = (start_idx + attempts) % g_ss_count_ext;
+        if (g_ss_list_ext[curr_idx].status == SS_STATUS_ONLINE) {
+            ss_index = curr_idx;
+            ss_fd = g_ss_list_ext[curr_idx].conn_fd;
+            break;
+        }
+        attempts++;
+    }
+    
+    // If no online server found
+    if (ss_index == -1) {
+        pthread_mutex_unlock(&ss_list_mutex_ext);
+        snprintf(resp_buf, MAX_MSG_LEN, "%s\n", RESP_SS_DOWN);
+        send(client_fd, resp_buf, strlen(resp_buf), 0);
+        pthread_mutex_unlock(&file_map_mutex);
+        return;
+    }
 
+    // We found a server! Unlock file map (but keep SS list locked for the transaction)
     pthread_mutex_unlock(&file_map_mutex);
 
     // 4. Send command while holding the lock
     char command_buf[MAX_MSG_LEN];
     sprintf(command_buf, "%s %s\n", NM_CREATE, filename);
     
-    if (send(ss_fd, command_buf, strlen(command_buf), 0) < 0) {
-        pthread_mutex_unlock(&ss_list_mutex_ext);
+    // FIX: Use MSG_NOSIGNAL to prevent crash if SS is dead
+    if (send(ss_fd, command_buf, strlen(command_buf), MSG_NOSIGNAL) < 0) {
         perror("Failed to send to SS");
-        snprintf(resp_buf, MAX_MSG_LEN, "%s\n", RESP_SRV_ERR);
+        // Since send failed, this SS is likely dead. 
+        // We can mark it offline or just report error.
+        pthread_mutex_unlock(&ss_list_mutex_ext);
+        
+        snprintf(resp_buf, MAX_MSG_LEN, "%s\n", RESP_SS_DOWN);
         send(client_fd, resp_buf, strlen(resp_buf), 0);
         return;
     }
     
-    // 5. Read ACK BEFORE unlocking
+    // 5. Read ACK
     char ss_resp[MAX_MSG_LEN];
     memset(ss_resp, 0, MAX_MSG_LEN);
     int bytes_read = read(ss_fd, ss_resp, MAX_MSG_LEN - 1);
     
-    // **NOW unlock after we have the response**
     pthread_mutex_unlock(&ss_list_mutex_ext);
     
     if (bytes_read <= 0) {
-        printf("[CREATE] SS failed to respond (bytes_read=%d, errno=%s)\n", 
-               bytes_read, strerror(errno));
+        printf("[CREATE] SS failed to respond\n");
         snprintf(resp_buf, MAX_MSG_LEN, "%s\n", RESP_SRV_ERR);
         send(client_fd, resp_buf, strlen(resp_buf), 0);
         return;
     }
     
-    // Clean up response for logging
     ss_resp[bytes_read] = '\0';
     char *first_line = strtok(ss_resp, "\n");
-    printf("[CREATE] SS[%d] responded: '%s'\n", ss_index, first_line ? first_line : ss_resp);
-    
-    // Restore the newline for response checking
-    if (first_line) {
-        strcpy(ss_resp, first_line);
-    }
     
     // --- Phase 3: Commit changes ---
     
-    if (strncmp(ss_resp, RESP_OK, strlen(RESP_OK)) == 0) {
+    if (first_line && strncmp(first_line, RESP_OK, strlen(RESP_OK)) == 0) {
         pthread_mutex_lock(&file_map_mutex);
 
-        // Re-check conflict
+        // Re-check conflict (race condition safety)
         file_index = trie_search(filename);
         if (file_index != -1) {
             snprintf(resp_buf, MAX_MSG_LEN, "%s\n", RESP_CONFLICT);
@@ -827,7 +833,8 @@ void do_create(int client_fd, char* username, char* filename) {
             rep_entry->replica_count = 1;
             
             int replicas_added = 0;
-            for (int attempt = 0; attempt < g_ss_count && replicas_added < (REPLICATION_FACTOR - 1); attempt++) {
+            // Note: loops g_ss_count_ext now for safety
+            for (int attempt = 0; attempt < g_ss_count_ext && replicas_added < (REPLICATION_FACTOR - 1); attempt++) {
                 int replica_ss = select_replica_ss(ss_index);
                 
                 if (replica_ss != -1 && replica_ss != ss_index) {
@@ -848,10 +855,7 @@ void do_create(int client_fd, char* username, char* filename) {
                     }
                 }
             }
-            
             g_file_replica_count++;
-            printf("[REPLICATION] File '%s' replicated to %d servers (primary: %d)\n", 
-                   filename, rep_entry->replica_count, ss_index);
         }
         pthread_mutex_unlock(&replica_mutex);
         
@@ -937,9 +941,9 @@ void do_undo(int client_fd, char* username, char* filename) {
     pthread_mutex_unlock(&file_map_mutex);
 
     // 4. Get the SS's COMMAND-LINE socket
-    pthread_mutex_lock(&ss_list_mutex);
-    int ss_fd = g_ss_list[ss_index].conn_fd; // <-- This is the important part
-    pthread_mutex_unlock(&ss_list_mutex);
+    pthread_mutex_lock(&ss_list_mutex_ext);
+    int ss_fd = g_ss_list_ext[ss_index].conn_fd; // <-- This is the important part
+    pthread_mutex_unlock(&ss_list_mutex_ext);
 
     // 5. Send command to the SS
     char command_buf[MAX_MSG_LEN];
@@ -1105,20 +1109,17 @@ void do_read(int client_fd, char* username, char* filename) {
     }
     pthread_mutex_unlock(&ss_list_mutex_ext);
 
-    // 4. Get SS client-facing IP/port
-    pthread_mutex_lock(&ss_list_mutex);
+// 4. Get SS client-facing IP/port
+    pthread_mutex_lock(&ss_list_mutex_ext);    
     char ss_ip[INET_ADDRSTRLEN];
-    int ss_port = g_ss_list[ss_index].client_port;
-    strcpy(ss_ip, g_ss_list[ss_index].ip);
-    pthread_mutex_unlock(&ss_list_mutex);
+    int ss_port = g_ss_list_ext[ss_index].client_port; 
+    strcpy(ss_ip, g_ss_list_ext[ss_index].ip);         
+    pthread_mutex_unlock(&ss_list_mutex_ext);      
 
-    // 5. Send the referral to the client
-    char response_buf[MAX_MSG_LEN];
-    sprintf(response_buf, "%s %s %d\n", RESP_SS_INFO, ss_ip, ss_port);
-    send(client_fd, response_buf, strlen(response_buf), 0);
+    // 5. Send SS info to client for direct connection
+    snprintf(resp_buf, MAX_MSG_LEN, "%s %s %d\n", RESP_SS_INFO, ss_ip, ss_port);
+    send(client_fd, resp_buf, strlen(resp_buf), 0);
 }
-
-// Add this new function to nm.c
 
 void do_write(int client_fd, char* username, char* filename) {
     char log_msg[MAX_MSG_LEN];
@@ -1243,83 +1244,59 @@ void do_write(int client_fd, char* username, char* filename) {
     pthread_mutex_unlock(&ss_list_mutex_ext);
 
     // 5. Get SS client-facing IP/port
-    pthread_mutex_lock(&ss_list_mutex);
+    pthread_mutex_lock(&ss_list_mutex_ext);        
     char ss_ip[INET_ADDRSTRLEN];
-    int ss_port = g_ss_list[ss_index].client_port;
-    strcpy(ss_ip, g_ss_list[ss_index].ip);
-    pthread_mutex_unlock(&ss_list_mutex);
-
+    int ss_port = g_ss_list_ext[ss_index].client_port; 
+    strcpy(ss_ip, g_ss_list_ext[ss_index].ip);         
+    pthread_mutex_unlock(&ss_list_mutex_ext);      
     // 6. Send the referral to the client
     sprintf(resp_buf, "%s %s %d\n", RESP_SS_INFO, ss_ip, ss_port);
     send(client_fd, resp_buf, strlen(resp_buf), 0);
 }
 
-// This is the function that each thread will run
-void *handle_connection(void *arg){
+void* handle_connection(void *arg){
     int conn_fd = *((int*)arg);
-    
     char buffer[MAX_MSG_LEN];
     memset(buffer, 0, MAX_MSG_LEN);
 
-    // 1. Read the HELLO message (the handshake)
     if (read(conn_fd, buffer, MAX_MSG_LEN - 1) <= 0) {
         printf("Handshake failed. Closing connection.\n");
         close(conn_fd);
+        free(arg); // Don't forget to free arg!
         return NULL;
     }
 
     printf("Handshake received: %s\n", buffer);
 
-    // 2. Decide WHO it is
     if (strncmp(buffer, C_INIT, strlen(C_INIT)) == 0) {
-        // --- It's a CLIENT ---
+        // ... Client logic (Same as before) ...
         char username[MAX_USERNAME_LEN];
-        sscanf(buffer, "%*s %s", username); // Parse the username
-
-        // ------------------ ADD THIS BLOCK ------------------
+        sscanf(buffer, "%*s %s", username);
+        
         pthread_mutex_lock(&registry_mutex);
         registry_add_user(username);
         pthread_mutex_unlock(&registry_mutex);
-        // -----------------------------------------------------
                 
         pthread_mutex_lock(&client_list_mutex);
-
         g_client_list[g_client_count].conn_fd = conn_fd;
         strcpy(g_client_list[g_client_count].username, username);
         g_client_count++;
-
         pthread_mutex_unlock(&client_list_mutex);
-
         
         char log_msg[MAX_MSG_LEN];
         snprintf(log_msg, MAX_MSG_LEN, "New connection: CLIENT, USER: %s", username);
         log_event(log_msg);
-        char resp_buf[MAX_MSG_LEN];
-        snprintf(resp_buf, MAX_MSG_LEN, "%s\n", RESP_OK);
-        send(conn_fd, resp_buf, strlen(resp_buf), 0); // Send "OK\n"
+        send(conn_fd, RESP_OK "\n", strlen(RESP_OK "\n"), 0);
         
-        // Pass to the client command loop
         handle_client_commands(arg);
         
     } else if (strncmp(buffer, S_INIT, strlen(S_INIT)) == 0) {
-        // --- It's a STORAGE SERVER ---
         char ip[INET_ADDRSTRLEN];
-        int client_port; // The port for *clients* to connect to
-        
-        // S_INIT <ip> <nm_port> <client_port>
-        // We only care about the client-facing IP and port
+        int client_port;
         sscanf(buffer, "%*s %s %*d %d", ip, &client_port); 
         
-        // Add to global SS list (MUST be thread-safe)
-        pthread_mutex_lock(&ss_list_mutex);
-        g_ss_list[g_ss_count].conn_fd = conn_fd; // This is the NM-SS command socket
-        strcpy(g_ss_list[g_ss_count].ip, ip);
-        g_ss_list[g_ss_count].client_port = client_port;
-        int new_ss_index = g_ss_count;
-        g_ss_count++;
-        pthread_mutex_unlock(&ss_list_mutex);
+        // --- LEGACY LIST LOGIC REMOVED ---
         
-        // Check if this is a recovery (SS with same IP/port reconnecting)
         bool is_recovery = false;
         int recovery_index = -1;
         
@@ -1328,145 +1305,93 @@ void *handle_connection(void *arg){
             if (strcmp(g_ss_list_ext[i].ip, ip) == 0 && 
                 g_ss_list_ext[i].client_port == client_port &&
                 g_ss_list_ext[i].status == SS_STATUS_OFFLINE) {
-                // This is a recovering server
                 is_recovery = true;
                 recovery_index = i;
-                g_ss_list_ext[i].conn_fd = conn_fd;
+                g_ss_list_ext[i].conn_fd = conn_fd; // Update FD
                 g_ss_list_ext[i].status = SS_STATUS_RECOVERING;
                 break;
             }
         }
         
-        // If not recovery, add as new server
+        int new_ss_index = g_ss_count_ext;
         if (!is_recovery) {
-            g_ss_list_ext[new_ss_index].conn_fd = conn_fd;
-            strcpy(g_ss_list_ext[new_ss_index].ip, ip);
-            g_ss_list_ext[new_ss_index].client_port = client_port;
-            g_ss_list_ext[new_ss_index].status = SS_STATUS_ONLINE;
-            g_ss_list_ext[new_ss_index].last_heartbeat = time(NULL);
-            g_ss_list_ext[new_ss_index].pending_write_count = 0;
-            if (new_ss_index >= g_ss_count_ext) {
-                g_ss_count_ext = new_ss_index + 1;
+            if (g_ss_count_ext < MAX_SS) {
+                g_ss_list_ext[new_ss_index].conn_fd = conn_fd;
+                strcpy(g_ss_list_ext[new_ss_index].ip, ip);
+                g_ss_list_ext[new_ss_index].client_port = client_port;
+                g_ss_list_ext[new_ss_index].status = SS_STATUS_ONLINE;
+                g_ss_list_ext[new_ss_index].last_heartbeat = time(NULL);
+                g_ss_list_ext[new_ss_index].pending_write_count = 0;
+                g_ss_count_ext++;
             }
         }
         pthread_mutex_unlock(&ss_list_mutex_ext);
         
         if (is_recovery) {
-            printf("[RECOVERY] Storage Server %s:%d reconnected (index=%d) - initiating recovery\n", ip, client_port, recovery_index);
+            printf("[RECOVERY] Storage Server %s:%d reconnected (index=%d)\n", ip, client_port, recovery_index);
         } else {
             printf("[HEARTBEAT] Registered new Storage Server at %s:%d (index=%d)\n", ip, client_port, new_ss_index);
         }
         
-        char resp_buf[MAX_MSG_LEN];
-        snprintf(resp_buf, MAX_MSG_LEN, "%s\n", RESP_OK);
-        send(conn_fd, resp_buf, strlen(resp_buf), 0); // Send "OK\n"
+        send(conn_fd, RESP_OK "\n", strlen(RESP_OK "\n"), 0);
         
-        // Trigger recovery process in background if needed
         if (is_recovery) {
             pthread_t recovery_tid;
             int* idx = malloc(sizeof(int));
             *idx = recovery_index;
-            if (pthread_create(&recovery_tid, NULL, (void*(*)(void*))handle_ss_recovery, idx) == 0) {
+            if (pthread_create(&recovery_tid, NULL, handle_ss_recovery, idx) == 0) {
                 pthread_detach(recovery_tid);
             }
         }
-        
         free(arg);
-        
-
     } 
-else if (strncmp(buffer, S_META_UPDATE, strlen(S_META_UPDATE)) == 0) {
-        // --- It's an SS sending a metadata update ---
-        printf("[NM] Received S_META_UPDATE: %s\n", buffer);
-        char cmd_tmp[100], filename[MAX_PATH_LEN], wc_str[20], cc_str[20];
-        int primary_ss_port_arg;
+    else if (strncmp(buffer, S_META_UPDATE, strlen(S_META_UPDATE)) == 0) {
+        // Format sent by SS: "S_META_UPDATE <ss_port> <filename> <word_count> <char_count>"
+        int ss_port;
+        char filename[MAX_PATH_LEN];
+        int wc = 0;
+        int cc = 0;
 
-        // 1. FIX: Added &primary_ss_port_arg to sscanf to correctly parse the message
-        // The message format from SS is: S_META_UPDATE <port> <filename> <wc> <cc>
-        if (sscanf(buffer, "%s %d %s %s %s", cmd_tmp, &primary_ss_port_arg, filename, wc_str, cc_str) < 5) {
-            printf("[NM] Malformed S_META_UPDATE. Ignoring.\n");
-        } else {
-            int word_count = atoi(wc_str);
-            int char_count = atoi(cc_str);
+        // 1. Parse the message
+        // We use %d for port, %s for filename, %d for words, %d for chars
+        if (sscanf(buffer, "%*s %d %s %d %d", &ss_port, filename, &wc, &cc) == 4) {
+            
+            char log_msg[MAX_MSG_LEN];
+            snprintf(log_msg, MAX_MSG_LEN, "META_UPDATE for %s: Words=%d, Chars=%d", filename, wc, cc);
+            log_event(log_msg);
 
+            // 2. Update the global map safely
             pthread_mutex_lock(&file_map_mutex);
-            int file_idx = -1;
-
-            // Update metadata in memory
-            for (int i = 0; i < g_file_count; i++) {
-                if (strcmp(g_file_map[i].path, filename) == 0) {
-                    g_file_map[i].word_count = word_count;
-                    g_file_map[i].char_count = char_count;
-                    g_file_map[i].modified_at = time(NULL); 
-                    file_idx = i;
-                    printf("[NM] Metadata updated for %s.\n", filename);
-                    break;
-                }
+            
+            int file_index = trie_search(filename);
+            if (file_index != -1) {
+                g_file_map[file_index].word_count = wc;
+                g_file_map[file_index].char_count = cc;
+                // Optionally update modified time here too if you want strict accuracy
+                g_file_map[file_index].modified_at = time(NULL);
+                
+                // Save to disk so updates persist across NM restarts
+                save_metadata_to_disk();
+                printf("[NM] Updated metadata for %s (W:%d C:%d)\n", filename, wc, cc);
+            } else {
+                printf("[NM] Warning: Received metadata update for unknown file %s\n", filename);
             }
-
-            // 2. FIX: Actually perform the Replication Sync
-            if (file_idx != -1) {
-                 // Get Primary SS IP from the map (we use the port sent in the msg)
-                 int primary_ss_idx = g_file_map[file_idx].ss_index;
-                 
-                 // We need the IP address to tell replicas where to connect
-                 char primary_ip[INET_ADDRSTRLEN];
-                 // Retrieve IP safely using the SS list lock
-                 pthread_mutex_lock(&ss_list_mutex);
-                 strcpy(primary_ip, g_ss_list[primary_ss_idx].ip);
-                 pthread_mutex_unlock(&ss_list_mutex);
-
-                 pthread_mutex_lock(&replica_mutex);
-                 // Find replication entry for this file
-                 for(int r=0; r<g_file_replica_count; r++) {
-                     if(strcmp(g_file_replicas[r].path, filename) == 0) {
-                         
-                         // Iterate through replicas and tell them to SYNC
-                         for(int k=1; k < g_file_replicas[r].replica_count; k++) {
-                             int replica_ss_idx = g_file_replicas[r].replica_ss_indices[k];
-                             
-                             // We need the socket FD of the replica to send the command
-                             pthread_mutex_lock(&ss_list_mutex_ext);
-                             if(g_ss_list_ext[replica_ss_idx].status == SS_STATUS_ONLINE) {
-                                 int replica_fd = g_ss_list_ext[replica_ss_idx].conn_fd;
-                                 
-                                 // Construct the sync command: NM_SYNC <filename> <primary_ip> <primary_port>
-                                 char sync_cmd[MAX_MSG_LEN];
-                                 snprintf(sync_cmd, MAX_MSG_LEN, "%s %s %s %d\n", 
-                                          NM_SYNC, filename, primary_ip, primary_ss_port_arg);
-                                 
-                                 // Send directly (handle_connection is already a thread, so blocking briefly is fine)
-                                 if (send(replica_fd, sync_cmd, strlen(sync_cmd), MSG_NOSIGNAL) > 0) {
-                                     printf("[REPLICATION] Sent SYNC for '%s' to Replica SS[%d]\n", 
-                                            filename, replica_ss_idx);
-                                 } else {
-                                     perror("[REPLICATION] Failed to send SYNC command");
-                                 }
-                             }
-                             pthread_mutex_unlock(&ss_list_mutex_ext);
-                         }
-                     }
-                 }
-                 pthread_mutex_unlock(&replica_mutex);
-            }
-
-            save_metadata_to_disk();
+            
             pthread_mutex_unlock(&file_map_mutex);
+        } else {
+            printf("[NM] Error: Malformed S_META_UPDATE message: %s\n", buffer);
         }
-        
-        // This was a temporary connection from SS, so we close it.
+
+        // 3. Clean up
         close(conn_fd);
         free(arg);
-        return NULL; 
+        return NULL;
     }
     else {
-        printf("Unknown handshake. Closing connection.\n");
+        printf("Unknown handshake.\n");
         close(conn_fd);
         free(arg);
     }
-    
-    // The thread exits when the helper function (handle_client/ss_commands) returns
-    printf("Connection handler thread exiting.\n");
     return NULL;
 }
 
@@ -1662,10 +1587,16 @@ void do_request_access(int client_fd, char* requester_username, char* filename, 
     // 3. Check if requester already has access
     for (int i = 0; i < file->acl_count; i++) {
         if (strcmp(requester_username, file->acl_list[i].username) == 0) {
-            snprintf(resp_buf, MAX_MSG_LEN, "%s You already have access to this file\n", RESP_CONFLICT);
-            send(client_fd, resp_buf, strlen(resp_buf), 0);
-            pthread_mutex_unlock(&file_map_mutex);
-            return;
+            // If they already have Write, or if they have Read and are asking for Read -> Reject
+            if (file->acl_list[i].permission == 'W' || 
+               (file->acl_list[i].permission == 'R' && permission_flag == 'R')) {
+                
+                snprintf(resp_buf, MAX_MSG_LEN, "%s You already have sufficient access to this file\n", RESP_CONFLICT);
+                send(client_fd, resp_buf, strlen(resp_buf), 0);
+                pthread_mutex_unlock(&file_map_mutex);
+                return;
+            }
+            // If they have 'R' and are asking for 'W', allow loop to finish so we can create a request
         }
     }
     
@@ -2125,9 +2056,9 @@ void do_move(int client_fd, char* username, char* filename, char* dest_folder) {
     // This blocks other metadata ops, ensuring safety.
     int ss_index = g_file_map[file_index].ss_index;
     
-    pthread_mutex_lock(&ss_list_mutex);
-    int ss_fd = g_ss_list[ss_index].conn_fd;
-    pthread_mutex_unlock(&ss_list_mutex);
+    pthread_mutex_lock(&ss_list_mutex_ext);
+    int ss_fd = g_ss_list_ext[ss_index].conn_fd;
+    pthread_mutex_unlock(&ss_list_mutex_ext);
 
     char cmd_buf[MAX_MSG_LEN];
     snprintf(cmd_buf, MAX_MSG_LEN, "%s %s %s\n", NM_RENAME, filename, new_path);
@@ -2298,9 +2229,9 @@ void do_delete(int client_fd, char* requester_username, char* filename) {
     // --- 2. Communicate with SS (No lock held) ---
 
     // 9. Get SS info
-    pthread_mutex_lock(&ss_list_mutex);
-    int ss_fd = g_ss_list[ss_index].conn_fd;
-    pthread_mutex_unlock(&ss_list_mutex);
+    pthread_mutex_lock(&ss_list_mutex_ext);
+    int ss_fd = g_ss_list_ext[ss_index].conn_fd;
+    pthread_mutex_unlock(&ss_list_mutex_ext);
 
     // 10. Send command to SS
     char command_buf[MAX_MSG_LEN];
@@ -2426,7 +2357,8 @@ void do_view(int client_fd, char* requester_username, char* flags) {
                 localtime_r(&file->accessed_at, &ltime);
                 strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &ltime);
                 
-                snprintf(line_buf, sizeof(line_buf), "| %-20s | %-5d | %-5d | %-20s | %-10s |\n", file->path, file->word_count, file->char_count, time_str, file->owner);
+                snprintf(line_buf, sizeof(line_buf), "| %-10s | %5d | %5d | %-16s | %-5s |\n", 
+                         file->path, file->word_count, file->char_count, time_str, file->owner);
             } else {
                 snprintf(line_buf, sizeof(line_buf), "%s\n", file->path);
             }
@@ -2639,9 +2571,9 @@ void do_checkpoint(int client_fd, char* username, char* filename, char* tag) {
     pthread_mutex_unlock(&file_map_mutex);
     
     // 2. Forward command to SS
-    pthread_mutex_lock(&ss_list_mutex);
-    int ss_fd = g_ss_list[ss_index].conn_fd;
-    pthread_mutex_unlock(&ss_list_mutex);
+    pthread_mutex_lock(&ss_list_mutex_ext);
+    int ss_fd = g_ss_list_ext[ss_index].conn_fd;
+    pthread_mutex_unlock(&ss_list_mutex_ext);
     
     char command_buf[MAX_MSG_LEN];
     snprintf(command_buf, MAX_MSG_LEN, "%s %s %s\n", NM_CHECKPOINT, filename, tag);
@@ -2709,11 +2641,11 @@ void do_viewcheckpoint(int client_fd, char* username, char* filename, char* tag)
     pthread_mutex_unlock(&file_map_mutex);
     
     // --- 2. Get SS Client-Facing Info (like do_exec) ---
-    pthread_mutex_lock(&ss_list_mutex);
+    pthread_mutex_lock(&ss_list_mutex_ext);
     char ss_ip[INET_ADDRSTRLEN];
-    int ss_port = g_ss_list[ss_index].client_port; // <-- The client port!
-    strcpy(ss_ip, g_ss_list[ss_index].ip);
-    pthread_mutex_unlock(&ss_list_mutex);
+    int ss_port = g_ss_list_ext[ss_index].client_port;
+    strcpy(ss_ip, g_ss_list_ext[ss_index].ip);        
+    pthread_mutex_unlock(&ss_list_mutex_ext);
 
     // --- 3. NM connects TO SS on a NEW socket ---
     int ss_sock = connect_to_server(ss_ip, ss_port);
@@ -2824,9 +2756,9 @@ void do_revert(int client_fd, char* username, char* filename, char* tag) {
     pthread_mutex_unlock(&file_map_mutex);
     
     // Forward to SS
-    pthread_mutex_lock(&ss_list_mutex);
-    int ss_fd = g_ss_list[ss_index].conn_fd;
-    pthread_mutex_unlock(&ss_list_mutex);
+    pthread_mutex_lock(&ss_list_mutex_ext);
+    int ss_fd = g_ss_list_ext[ss_index].conn_fd;
+    pthread_mutex_unlock(&ss_list_mutex_ext);
     
     char command_buf[MAX_MSG_LEN];
     snprintf(command_buf, MAX_MSG_LEN, "%s %s %s\n", NM_REVERT, filename, tag);
@@ -2895,13 +2827,14 @@ void do_listcheckpoints(int client_fd, char* username, char* filename) {
     int ss_index = file->ss_index;
     pthread_mutex_unlock(&file_map_mutex);
     
-    // --- 2. Get SS Client-Facing Info (like do_exec) ---
-    pthread_mutex_lock(&ss_list_mutex);
+    // 4. Get SS client-facing IP/port
+   // 4. Get SS client-facing IP/port
+    pthread_mutex_lock(&ss_list_mutex_ext);      
     char ss_ip[INET_ADDRSTRLEN];
-    int ss_port = g_ss_list[ss_index].client_port; // <-- The client port!
-    strcpy(ss_ip, g_ss_list[ss_index].ip);
-    pthread_mutex_unlock(&ss_list_mutex);
-
+    int ss_port = g_ss_list_ext[ss_index].client_port;
+    strcpy(ss_ip, g_ss_list_ext[ss_index].ip); 
+    pthread_mutex_unlock(&ss_list_mutex_ext);    
+    
     // --- 3. NM connects TO SS on a NEW socket ---
     int ss_sock = connect_to_server(ss_ip, ss_port);
     if (ss_sock < 0) {
@@ -2960,8 +2893,8 @@ void* handle_client_commands(void* arg) {
     char buffer[MAX_MSG_LEN];
     char cmd[MAX_MSG_LEN];
     char arg1[MAX_PATH_LEN]; // Use MAX_PATH_LEN for filenames
-    char arg2[MAX_USERNAME_LEN]; // For target_user
-    char arg3[10];              // For flags ("-R" or "-W")
+    char arg2[MAX_PATH_LEN]; // For target_user
+    char arg3[MAX_PATH_LEN];              // For flags ("-R" or "-W")
     char resp_buf[MAX_MSG_LEN];
 
     char username[MAX_USERNAME_LEN] = "unknown";
@@ -2979,8 +2912,8 @@ void* handle_client_commands(void* arg) {
         memset(buffer, 0, MAX_MSG_LEN);
         memset(cmd, 0, MAX_MSG_LEN);     
         memset(arg1, 0, MAX_PATH_LEN); 
-        memset(arg2, 0, MAX_USERNAME_LEN);
-        memset(arg3, 0, 10);
+        memset(arg2, 0, MAX_PATH_LEN);
+        memset(arg3, 0, MAX_PATH_LEN);
 
         int bytes_read = read(client_fd, buffer, MAX_MSG_LEN - 1);
 
@@ -3004,7 +2937,7 @@ void* handle_client_commands(void* arg) {
             break; // Exit loop
         }
         
-        int items_scanned = sscanf(buffer, "%s %s %s %s", cmd, arg1, arg2, arg3);
+        int items_scanned = sscanf(buffer, "%1023s %255s %255s %255s", cmd, arg1, arg2, arg3);
         if (items_scanned <= 0) {
             continue; // Ignore empty lines (like just hitting Enter)
         }
@@ -3023,11 +2956,18 @@ void* handle_client_commands(void* arg) {
             do_create(client_fd, username, arg1);
         } 
         else if (strncmp(cmd, C_REQ_ADD_ACC, strlen(C_REQ_ADD_ACC)) == 0) {
-            if (items_scanned < 4) { // Needs 4 args: CMD, file, user, flag
+            if (items_scanned < 4) {
                 snprintf(resp_buf, MAX_MSG_LEN, "%s\n", RESP_BAD_REQ);
                 send(client_fd, resp_buf, strlen(resp_buf), 0);
             } else {
-                do_add_access(client_fd, username, arg1, arg2, arg3[1]); // arg3[1] is 'R' or 'W'
+                // Robustness check: ensure arg1 is actually the flag
+                if (arg1[0] == '-') {
+                    do_add_access(client_fd, username, arg2, arg3, arg1[1]);
+                } else {
+                    // Handle legacy case or user error (File User Flag)
+                    // This makes it compatible with old clients or netcat mistakes
+                    do_add_access(client_fd, username, arg1, arg2, arg3[1]);
+                }
             }
         }
         else if (strncmp(cmd, C_REQ_REM_ACC, strlen(C_REQ_REM_ACC)) == 0) {
@@ -3360,29 +3300,29 @@ int select_replica_ss(int exclude_ss_index) {
     // Select a storage server for replication, excluding the specified index
     // Returns -1 if no suitable server found
     
-    pthread_mutex_lock(&ss_list_mutex);
+    pthread_mutex_lock(&ss_list_mutex_ext);
     
-    if (g_ss_count <= 1) {
-        pthread_mutex_unlock(&ss_list_mutex);
+    if (g_ss_count_ext <= 1) {
+        pthread_mutex_unlock(&ss_list_mutex_ext);
         return -1; // No other servers available
     }
     
     // Use static counter to distribute replicas across different servers
     static int last_selected = 0;
     int attempts = 0;
-    int candidate = (last_selected + 1) % g_ss_count;
+    int candidate = (last_selected + 1) % g_ss_count_ext;
     
-    while (attempts < g_ss_count) {
+    while (attempts < g_ss_count_ext) {
         if (candidate != exclude_ss_index) {
             last_selected = candidate;
-            pthread_mutex_unlock(&ss_list_mutex);
+            pthread_mutex_unlock(&ss_list_mutex_ext);
             return candidate;
         }
-        candidate = (candidate + 1) % g_ss_count;
+        candidate = (candidate + 1) % g_ss_count_ext;
         attempts++;
     }
     
-    pthread_mutex_unlock(&ss_list_mutex);
+    pthread_mutex_unlock(&ss_list_mutex_ext);
     return -1;
 }
 
@@ -3456,7 +3396,14 @@ void* heartbeat_thread(void* arg) {
                 if (now - g_ss_list_ext[i].last_heartbeat > SS_TIMEOUT) {
                     printf("[HEARTBEAT] SS[%d] timed out (last seen %ld seconds ago) - triggering failure handling\n",
                            i, now - g_ss_list_ext[i].last_heartbeat);
+                    // 1. Release lock to prevent Deadlock
+                    pthread_mutex_unlock(&ss_list_mutex_ext);
+                    
+                    // 2. Call handler
                     handle_ss_failure(i);
+                    
+                    // 3. Re-acquire lock to continue loop safely
+                    pthread_mutex_lock(&ss_list_mutex_ext);
                 }
             }
         }
@@ -3573,9 +3520,32 @@ void handle_ss_failure(int failed_ss_index) {
     printf("[FAILURE] Handling failure of SS[%d]\n", failed_ss_index);
     
     pthread_mutex_lock(&ss_list_mutex_ext);
+    
+    time_t now = time(NULL);
+
+    // 1. Check if it is RECOVERING (It genuinely reconnected)
+    if (g_ss_list_ext[failed_ss_index].status == SS_STATUS_RECOVERING) {
+        printf("[FAILURE] SS[%d] is recovering. Aborting failover.\n", failed_ss_index);
+        pthread_mutex_unlock(&ss_list_mutex_ext);
+        return;
+    }
+
+    // 2. Check if it is ONLINE but has a NEW heartbeat (Race condition save)
+    // If the heartbeat is recent (less than timeout), it means it came back to life while we were unlocked.
+    if (g_ss_list_ext[failed_ss_index].status == SS_STATUS_ONLINE && 
+        (now - g_ss_list_ext[failed_ss_index].last_heartbeat < SS_TIMEOUT)) {
+        printf("[FAILURE] SS[%d] reconnected (fresh heartbeat). Aborting failover.\n", failed_ss_index);
+        pthread_mutex_unlock(&ss_list_mutex_ext);
+        return; 
+    }
+
+    // 3. If we are here, it is truly dead. Mark it OFFLINE.
     g_ss_list_ext[failed_ss_index].status = SS_STATUS_OFFLINE;
+    
     pthread_mutex_unlock(&ss_list_mutex_ext);
     
+    // --- Proceed with Failover Logic (No changes needed below this line) ---
+
     // Update file map to point to replica servers
     pthread_mutex_lock(&file_map_mutex);
     pthread_mutex_lock(&replica_mutex);
@@ -3630,46 +3600,76 @@ void handle_ss_failure(int failed_ss_index) {
     printf("[FAILURE] Failover complete for SS[%d]\n", failed_ss_index);
 }
 
-void handle_ss_recovery(int recovered_ss_index) {
+void* handle_ss_recovery(void* arg) {
+    int recovered_ss_index = *((int*)arg);
+    free(arg);
+
     printf("[RECOVERY] Handling recovery of SS[%d]\n", recovered_ss_index);
     
     pthread_mutex_lock(&ss_list_mutex_ext);
     g_ss_list_ext[recovered_ss_index].status = SS_STATUS_RECOVERING;
     pthread_mutex_unlock(&ss_list_mutex_ext);
     
-    // Get list of files that should be on this server
+    // LOCK EVERYTHING: We are modifying global replication state
     pthread_mutex_lock(&file_map_mutex);
     pthread_mutex_lock(&replica_mutex);
     
-    char files_to_sync[MAX_FILES][MAX_PATH_LEN];
-    int files_to_sync_count = 0;
-    
-    // Find all files that should be on this server (as primary or replica)
-    for (int i = 0; i < g_file_count; i++) {
-        if (g_file_map[i].ss_index == recovered_ss_index) {
-            // This server is the primary
-            strcpy(files_to_sync[files_to_sync_count], g_file_map[i].path);
-            files_to_sync_count++;
-        }
-    }
-    
-    // Check replica lists
+    int synced_count = 0;
+
     for (int i = 0; i < g_file_replica_count; i++) {
-        for (int j = 0; j < g_file_replicas[i].replica_count; j++) {
-            if (g_file_replicas[i].replica_ss_indices[j] == recovered_ss_index) {
-                // This server should have this file as a replica
-                bool already_added = false;
-                for (int k = 0; k < files_to_sync_count; k++) {
-                    if (strcmp(files_to_sync[k], g_file_replicas[i].path) == 0) {
-                        already_added = true;
-                        break;
-                    }
-                }
-                if (!already_added) {
-                    strcpy(files_to_sync[files_to_sync_count], g_file_replicas[i].path);
-                    files_to_sync_count++;
-                }
+        FileReplicationEntry* rep = &g_file_replicas[i];
+        
+        bool already_has = false;
+        for(int k=0; k<rep->replica_count; k++) {
+            if(rep->replica_ss_indices[k] == recovered_ss_index) {
+                already_has = true; 
                 break;
+            }
+        }
+
+        if (!already_has && rep->replica_count < REPLICATION_FACTOR) {
+            // Find the CURRENT Primary
+            int primary_ss_idx = -1;
+            for(int f=0; f<g_file_count; f++) {
+                if(strcmp(g_file_map[f].path, rep->path) == 0) {
+                    primary_ss_idx = g_file_map[f].ss_index;
+                    break;
+                }
+            }
+
+            // Ensure primary is actually online
+            pthread_mutex_lock(&ss_list_mutex_ext);
+            bool primary_online = (primary_ss_idx != -1 && 
+                                   g_ss_list_ext[primary_ss_idx].status == SS_STATUS_ONLINE);
+            
+            // Retrieve socket and primary info safely while locked
+            int ss_fd = -1;
+            char primary_ip[INET_ADDRSTRLEN];
+            int primary_port = 0;
+            
+            if (primary_online) {
+                ss_fd = g_ss_list_ext[recovered_ss_index].conn_fd;
+                strcpy(primary_ip, g_ss_list_ext[primary_ss_idx].ip);
+                primary_port = g_ss_list_ext[primary_ss_idx].client_port;
+            }
+            pthread_mutex_unlock(&ss_list_mutex_ext);
+
+            if (primary_online && ss_fd != -1) {
+                char cmd[MAX_MSG_LEN];
+                snprintf(cmd, MAX_MSG_LEN, "%s %s %s %d\n", NM_SYNC, rep->path, primary_ip, primary_port);
+                
+                if (send(ss_fd, cmd, strlen(cmd), MSG_NOSIGNAL) > 0) {
+                     char ack[MAX_MSG_LEN];
+                     struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+                     setsockopt(ss_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                     
+                     if (read(ss_fd, ack, MAX_MSG_LEN) > 0 && strncmp(ack, "200", 3) == 0) {
+                         rep->replica_ss_indices[rep->replica_count] = recovered_ss_index;
+                         rep->replica_count++;
+                         synced_count++;
+                         printf("[RECOVERY] Restored replica of '%s' to SS[%d]\n", rep->path, recovered_ss_index);
+                     }
+                }
             }
         }
     }
@@ -3677,107 +3677,12 @@ void handle_ss_recovery(int recovered_ss_index) {
     pthread_mutex_unlock(&replica_mutex);
     pthread_mutex_unlock(&file_map_mutex);
     
-    printf("[RECOVERY] SS[%d] should have %d files\n", recovered_ss_index, files_to_sync_count);
-    
-    // Request list of files currently on recovered server
-    pthread_mutex_lock(&ss_list_mutex);
-    int ss_fd = g_ss_list[recovered_ss_index].conn_fd;
-    pthread_mutex_unlock(&ss_list_mutex);
-    
-    char cmd[MAX_MSG_LEN];
-    snprintf(cmd, MAX_MSG_LEN, "%s\n", NM_LIST_FILES);
-    send(ss_fd, cmd, strlen(cmd), MSG_NOSIGNAL);
-    
-    // Read file list from SS (format: S_FILE_LIST\nfile1\nfile2\n...\nS_FILE_LIST_END)
-    char existing_files[MAX_FILES][MAX_PATH_LEN];
-    int existing_count = 0;
-    
-    char line_buf[MAX_MSG_LEN];
-    FILE* ss_stream = fdopen(dup(ss_fd), "r");
-    
-    if (fgets(line_buf, MAX_MSG_LEN, ss_stream)) {
-        if (strncmp(line_buf, "S_FILE_LIST", 11) == 0) {
-            while (fgets(line_buf, MAX_MSG_LEN, ss_stream)) {
-                if (strncmp(line_buf, "S_FILE_LIST_END", 15) == 0) {
-                    break;
-                }
-                line_buf[strcspn(line_buf, "\n")] = 0; // Remove newline
-                if (strlen(line_buf) > 0) {
-                    strcpy(existing_files[existing_count], line_buf);
-                    existing_count++;
-                }
-            }
-        }
-    }
-    fclose(ss_stream);
-    
-    printf("[RECOVERY] SS[%d] currently has %d files\n", recovered_ss_index, existing_count);
-    
-    // Find missing files and trigger sync
-    int synced_count = 0;
-    for (int i = 0; i < files_to_sync_count; i++) {
-        bool found = false;
-        for (int j = 0; j < existing_count; j++) {
-            if (strcmp(files_to_sync[i], existing_files[j]) == 0) {
-                found = true;
-                break;
-            }
-        }
-        
-        if (!found) {
-            // File is missing, need to sync
-            printf("[RECOVERY] File '%s' is missing on SS[%d], syncing...\n", files_to_sync[i], recovered_ss_index);
-            
-            // Find a source server that has this file
-            pthread_mutex_lock(&replica_mutex);
-            int source_ss = -1;
-            
-            for (int k = 0; k < g_file_replica_count; k++) {
-                if (strcmp(g_file_replicas[k].path, files_to_sync[i]) == 0) {
-                    for (int m = 0; m < g_file_replicas[k].replica_count; m++) {
-                        int candidate = g_file_replicas[k].replica_ss_indices[m];
-                        if (candidate != recovered_ss_index) {
-                            pthread_mutex_lock(&ss_list_mutex_ext);
-                            if (g_ss_list_ext[candidate].status == SS_STATUS_ONLINE) {
-                                source_ss = candidate;
-                                pthread_mutex_unlock(&ss_list_mutex_ext);
-                                break;
-                            }
-                            pthread_mutex_unlock(&ss_list_mutex_ext);
-                        }
-                    }
-                    if (source_ss != -1) break;
-                }
-            }
-            pthread_mutex_unlock(&replica_mutex);
-            
-            if (source_ss != -1) {
-                // Send sync command: NM_SYNC <filename> <source_ss_ip> <source_ss_port>
-                pthread_mutex_lock(&ss_list_mutex);
-                char source_ip[INET_ADDRSTRLEN];
-                int source_port = g_ss_list[source_ss].client_port;
-                strcpy(source_ip, g_ss_list[source_ss].ip);
-                pthread_mutex_unlock(&ss_list_mutex);
-                
-                snprintf(cmd, MAX_MSG_LEN, "%s %s %s %d\n", NM_SYNC, files_to_sync[i], source_ip, source_port);
-                send(ss_fd, cmd, strlen(cmd), MSG_NOSIGNAL);
-                
-                // Wait for ACK
-                char ack[MAX_MSG_LEN];
-                struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
-                setsockopt(ss_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-                if (read(ss_fd, ack, MAX_MSG_LEN) > 0 && strncmp(ack, "200", 3) == 0) {
-                    synced_count++;
-                    printf("[RECOVERY] Successfully synced '%s' to SS[%d]\n", files_to_sync[i], recovered_ss_index);
-                }
-            }
-        }
-    }
-    
     pthread_mutex_lock(&ss_list_mutex_ext);
     g_ss_list_ext[recovered_ss_index].status = SS_STATUS_ONLINE;
     g_ss_list_ext[recovered_ss_index].last_heartbeat = time(NULL);
     pthread_mutex_unlock(&ss_list_mutex_ext);
     
     printf("[RECOVERY] Recovery complete for SS[%d]: synced %d files\n", recovered_ss_index, synced_count);
+    
+    return NULL;
 }

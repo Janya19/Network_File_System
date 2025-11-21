@@ -34,6 +34,9 @@
 #define MAX_PATH_LEN 256
 #define MAX_USERNAME_LEN 64
 
+/* Maximum number of Storage Servers that can connect to the system */
+#define MAX_SS 20
+
 
 /*
  * ============================================================================
@@ -280,5 +283,21 @@
 /* [Replication] SS-to-SS: Request file for replication */
 /* "SS_REQ_REPLICA <filename>" */
 #define SS_REQ_REPLICA "SS_REQ_REPLICA"
+
+// Add after #define SS_LOG_FILE "ss.log"
+
+/* ============================================================================
+ * NETWORK CONFIGURATION
+ * ============================================================================
+ */
+
+// Default IPs/Hosts - can be overridden at compile time or runtime
+#ifndef NM_HOST
+#define NM_HOST "127.0.0.1"     // Default to localhost, override for different networks
+#endif
+
+#ifndef NM_PORT
+#define NM_PORT 9001            // This stays hardcoded as "well-known port"
+#endif
 
 #endif // PROTOCOL_H

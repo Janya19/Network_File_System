@@ -6,8 +6,13 @@
 #include <arpa/inet.h>  // For sockaddr_in, inet_pton
 #include <sys/socket.h> // For socket, connect
 #include <stdbool.h>
+#include <errno.h>      // For errno, EWOULDBLOCK, EAGAIN
+#include <sys/time.h>   // For gettimeofday
 
-#define NM_IP "127.0.0.1" // IP for the Name Server (NM)
+#include "config.h"  // Add this at the top with other includes
+
+// REMOVE the hardcoded #define NM_IP line
+// Use NM_HOST from config.h instead
 
 void print_error(const char *code)
 {
@@ -29,12 +34,20 @@ void print_error(const char *code)
         printf("Unexpected response: %s\n", code);
 }
 
-int main()
+int main(int argc, char* argv[])
 {
     int sockfd;
     struct sockaddr_in nm_addr;
     char username[100];
     char init_msg[120];
+
+    // UPDATED ARGUMENT PARSING
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <nm-ip>\n", argv[0]);
+        fprintf(stderr, "Example: ./bin/client 192.168.1.10\n");
+        exit(1);
+    }
+    char* nm_ip_arg = argv[1];
 
     // Prompt the user to enter their username
     printf("Enter username: ");
@@ -58,9 +71,11 @@ int main()
     memset(&nm_addr, 0, sizeof(nm_addr));
     nm_addr.sin_family = AF_INET;
     nm_addr.sin_port = htons(NM_LISTEN_PORT);
-    if (inet_pton(AF_INET, NM_IP, &nm_addr.sin_addr) <= 0)
+    
+    // USE ARGUMENT IP
+    if (inet_pton(AF_INET, nm_ip_arg, &nm_addr.sin_addr) <= 0)
     {
-        perror("Invalid address for Name Server");
+        fprintf(stderr, "Invalid Name Server IP: %s\n", nm_ip_arg);
         exit(EXIT_FAILURE);
     }
 
@@ -241,16 +256,17 @@ int main()
         // ----- ADDACCESS -----
         else if (strcmp(cmd, "ADDACCESS") == 0)
         {
-            char *filename = strtok(NULL, " ");
-            char *user = strtok(NULL, " ");
-            char *perm = strtok(NULL, " ");
-            if (!filename || !user || !perm)
+            char *perm_str = strtok(NULL, " "); 
+            char *filename = strtok(NULL, " "); 
+            char *user = strtok(NULL, " ");     
+
+            if (!perm_str || !filename || !user)
             {
-                printf("Usage: ADDACCESS <filename> <username> <-R|-W>\n");
+                printf("Usage: ADDACCESS <-R|-W> <filename> <username>\n");
                 continue;
             }
             snprintf(request, sizeof(request), "%s %s %s %s\n",
-                     C_REQ_ADD_ACC, filename, user, perm);
+                     C_REQ_ADD_ACC, perm_str, filename, user);
             send(sockfd, request, strlen(request), 0);
             int n = recv(sockfd, response, sizeof(response) - 1, 0);
             if (n <= 0)
@@ -349,13 +365,28 @@ int main()
             snprintf(request, sizeof(request), "%s %s\n", C_REQ_VIEW, flags);
             send(sockfd, request, strlen(request), 0);
             int n = recv(sockfd, response, sizeof(response) - 1, 0);
+
             if (n <= 0)
             {
                 perror("recv");
                 continue;
             }
             response[n] = '\0';
-            printf("=== Files Visible to You ===\n%s\n", response + 4);
+            if (strncmp(response, "200", 3) == 0) {
+                // Check if user asked for detailed view (-l)
+                if (strstr(flags, "l") != NULL) {
+                    printf("---------------------------------------------------------\n");
+                    printf("|  Filename  | Words | Chars | Last Access Time | Owner |\n");
+                    printf("|------------|-------|-------|------------------|-------|\n");
+                    printf("%s", response + 4); // Print the rows sent by server (skip "200 ")
+                    printf("---------------------------------------------------------\n");
+                } else {
+                    // Standard view
+                    printf("=== Files Visible to You ===\n%s\n", response + 4);
+                }
+            } else {
+                print_error(response);
+            }
         }
 
         // ----- INFO -----
@@ -614,14 +645,69 @@ int main()
             snprintf(request, sizeof(request), "%s %s\n", SS_GET_STREAM, filename);
             send(ss_sock, request, strlen(request), 0);
 
+            // Set a receive timeout to detect if server hangs or dies
+            struct timeval timeout;
+            timeout.tv_sec = 5;  // 5 second timeout
+            timeout.tv_usec = 0;
+            setsockopt(ss_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
             printf("Streaming %s...\n", filename);
-            while ((n = recv(ss_sock, response, sizeof(response) - 1, 0)) > 0)
+            bool had_error = false;
+            bool received_any_data = false;
+            int idle_count = 0;
+            
+            while (1)
             {
-                response[n] = '\0';
-                printf("%s", response);
-                fflush(stdout);
+                n = recv(ss_sock, response, sizeof(response) - 1, 0);
+                
+                if (n < 0)
+                {
+                    // Check if it's a timeout or actual error
+                    if (errno == EWOULDBLOCK || errno == EAGAIN)
+                    {
+                        // Timeout - server might be dead or slow
+                        idle_count++;
+                        if (idle_count > 1 && received_any_data)
+                        {
+                            // If we got data before and now timeout, server likely died
+                            had_error = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    else
+                    {
+                        // Actual error (connection reset, etc.)
+                        had_error = true;
+                        break;
+                    }
+                }
+                else if (n == 0)
+                {
+                    // Connection closed by server
+                    // This is only normal if we received some data (could be empty file)
+                    // But if we were actively receiving and it suddenly closes, it's suspicious
+                    break;
+                }
+                else
+                {
+                    // Successfully received data
+                    received_any_data = true;
+                    idle_count = 0;  // Reset idle counter
+                    response[n] = '\0';
+                    printf("%s", response);
+                    fflush(stdout);
+                }
             }
-            printf("\n--- End of stream ---\n");
+            
+            if (had_error)
+            {
+                printf("\n--- Error: Storage server disconnected during streaming ---\n");
+            }
+            else
+            {
+                printf("\n--- End of stream ---\n");
+            }
             close(ss_sock);
         }
 
@@ -1097,7 +1183,43 @@ int main()
             if(strncmp(response, "200", 3) == 0) printf("%s", response+4);
             else print_error(response);
         }
-        
+        else if (strcmp(cmd, "HELP") == 0)
+        {
+            printf("\n--- Available Commands ---\n");
+            printf("File Operations:\n");
+            printf("  CREATE <filename>              : Create a new file\n");
+            printf("  READ <filename>                : Read file content\n");
+            printf("  WRITE <filename> <sentence_id> : Edit a specific sentence (ends with ETIRW)\n");
+            printf("  DELETE <filename>              : Delete a file\n");
+            printf("  INFO <filename>                : View file metadata (owner, size, etc.)\n");
+            printf("  STREAM <filename>              : Stream content word-by-word\n");
+            printf("  EXEC <filename>                : Execute file content as a script\n");
+             
+            printf("\nAccess Control:\n"); 
+            printf("  ADDACCESS -R <file> <user>     : Grant Read access\n");
+            printf("  ADDACCESS -W <file> <user>     : Grant Write access\n");
+            printf("  REMACCESS <file> <user>        : Revoke access\n");
+            printf("  REQACCESS <file> -R/-W         : Request access from owner\n");
+            printf("  VIEWREQUESTS <file>            : View pending requests (Owner only)\n");
+            printf("  APPROVE <req_id>               : Approve a request\n");
+            printf("  DENY <req_id>                  : Deny a request\n");
+            printf("  MYREQUESTS                     : View status of your sent requests\n");
+ 
+            printf("\nCheckpoints & Folders:\n"); 
+            printf("  CHECKPOINT <file> <tag>        : Save current state as a checkpoint\n");
+            printf("  VIEWCHECKPOINT <file> <tag>    : Read a specific checkpoint\n");
+            printf("  REVERT <file> <tag>            : Revert file to a checkpoint\n");
+            printf("  LISTCHECKPOINTS <file>         : List all checkpoints for a file\n");
+            printf("  CREATEFOLDER <name>            : Create a new folder\n");
+            printf("  MOVE <file> <folder>           : Move a file into a folder\n");
+            printf("  VIEWFOLDER <name>              : List folder contents\n");
+ 
+            printf("\nGeneral:\n"); 
+            printf("  VIEW [-l, -a]                  : List accessible files (-l for details and -a for admin view of all files)\n");
+            printf("  LIST                           : List all registered users\n");
+            printf("  EXIT / QUIT                    : Disconnect and exit\n");
+            printf("--------------------------\n");
+        }
         // ----- Exit command -----
         else if (strcmp(cmd, "QUIT") == 0 || strcmp(cmd, "EXIT") == 0)
         {
